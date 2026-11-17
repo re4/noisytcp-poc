@@ -56,6 +56,19 @@ make            # or: cc -O2 -pthread -o noisytcp noisytcp.c
 Requirements: Linux, a C11 compiler, and root (`CAP_NET_RAW` for the raw IPv4
 and `AF_PACKET` sockets). No external libraries.
 
+The build needs the C library *headers*, which minimal cloud/container images
+often ship without:
+
+| Distro | Packages |
+|---|---|
+| Debian / Ubuntu | `apt-get install -y build-essential` (or just `libc6-dev`) |
+| Fedora / RHEL | `dnf install -y gcc glibc-devel` |
+| Alpine | `apk add build-base` |
+| Arch | `pacman -S base-devel` |
+
+If the compiler reports `fatal error: arpa/inet.h: No such file or directory`,
+that is the missing `libc6-dev`/`glibc-devel` package, not a code problem.
+
 ## 4. Run
 
 Always start with `probe`, then `verify`, then `race`.
@@ -63,7 +76,7 @@ Always start with `probe`, then `verify`, then `race`.
 ```sh
 ./noisytcp --victim 192.0.2.10 --port 8080 --mode probe
 ./noisytcp --victim 192.0.2.10 --port 8080 --mode verify
-./noisytcp --victim 192.0.2.10 --port 8080 --mode race --duration 600 --batch 8
+./noisytcp --victim 192.0.2.10 --port 8080 --mode race --duration 600
 ```
 
 `probe` sends one SYN and reports the SYN-ACK plus whether the host kernel
@@ -84,7 +97,7 @@ actually did, including a wire-level check that **R** is really in the ehash.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--batch N` | 8 | tuples raced per round; raise it to amortise the queue refill |
+| `--batch N` | 0 (auto) | tuples per round. `0` uses the calibrated queue depth, which is also the practical ceiling: one round costs one round trip, so attempts/s ≈ batch / RTT |
 | `--readers N` | 1 | extra fragmented lookups in flight per shot |
 | `--fill N` / `--backlog N` | calibrate | skip calibration and use this many queued SYNs |
 | `--frag-gap-us` | 20 | delay between the two fragments of the lookup packet |
@@ -92,6 +105,7 @@ actually did, including a wire-level check that **R** is really in the ehash.
 | `--alloc-gap-us` | 4 | delay between that RST and the cookie ACK that reallocates the slot |
 | `--jitter-us` | 4 | random spread added to each gap (phase sweep) |
 | `--settle-us` | 300 | delay between packet groups, so the target can process them in order |
+| `--synack-ms` | 10 (auto) | how long to wait for a SYN-ACK. At startup the tool measures the round trip and raises this to 4×RTT+10 ms unless you set it explicitly |
 | `--spoof` + `--src IP` | off | claim a non-local source address with ARP so the local kernel never sees the SYN-ACKs |
 | `--dev NAME` | from route | interface to sniff |
 | `--sport-range A-B` | 32768-60999 | source ports used for tuples and filler |
@@ -161,8 +175,12 @@ SYN-ACK) or a request socket existed (`flags=0x10`, challenge ACK).
 The race is a phase-alignment problem between two CPUs, so the gaps matter
 more than raw packet rate.
 
-* `--batch 8..32` amortises the queue refill; try larger batches on servers
-  with a large `listen()` backlog.
+* `--batch` (or the default `0`, which uses the calibrated queue depth) is the
+  main rate lever: every request socket occupies a slot in the target's SYN
+  queue, and cookie SYNs are only honoured while that queue is full, so a round
+  is bounded by the queue depth and separated from the next by one round trip.
+  On a WAN path attempts/s ≈ batch / RTT and no amount of tuning changes that;
+  the fix is a shorter RTT, not more parallelism.
 * `--free-gap-us` / `--alloc-gap-us` set the distance between the completing
   fragment, the RST and the cookie ACK. Smaller is tighter; if the ACK keeps
   finding **R** still present, the RST is arriving too late — reduce or
@@ -177,6 +195,21 @@ The target must have two or more RX queues, or RPS enabled, for the fragment
 trick to split the lookup from the control packets. A target with a single queue
 and RPS disabled cannot be triggered this way at all (that is also mitigation #2
 in the advisory).
+
+### "target does not answer SYN packets"
+
+The tool prints this when the calibration gets no SYN-ACK. On a WAN path the
+usual cause is the timeout, not a filtered port: the tool measures the RTT at
+startup and widens `--synack-ms` automatically, but if you see it, check with a
+normal connect (`curl -kI https://TARGET/`, `nc -vz TARGET 443`). If that works
+and the tool still reports nothing, the path is dropping the raw SYNs (some
+middleboxes drop SYNs without TCP options) — compare with `tcpdump -ni eth0 -e
+'tcp and port 443'` while `--mode probe --debug` runs: you should see the SYN
+leave and the SYN-ACK arrive.
+
+A long round trip also slows the race: every round harvests fresh cookies, so
+the round rate is bounded by roughly one RTT. A 100 ms path gives a few rounds
+per second; raise `--batch` to compensate.
 
 ## 8. Limitations
 
